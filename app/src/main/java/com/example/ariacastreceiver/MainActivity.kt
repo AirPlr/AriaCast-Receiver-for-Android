@@ -1,5 +1,6 @@
 package com.example.ariacastreceiver
 
+import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -7,9 +8,13 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.TransitionDrawable
 import android.os.Bundle
+import android.view.GestureDetector
+import android.view.MotionEvent
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
@@ -19,7 +24,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.palette.graphics.Palette
 import coil.load
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -32,18 +38,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var currentTime: TextView
     private lateinit var totalTime: TextView
     private lateinit var progressBar: ProgressBar
+    private lateinit var rootLayout: ConstraintLayout
+
+    private lateinit var gestureDetector: GestureDetector
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // Make app full screen
         hideSystemUI()
 
-        server = AriaCastServer(applicationContext)
+        val prefs = getSharedPreferences("AriaCastPrefs", Context.MODE_PRIVATE)
+        val savedName = prefs.getString("receiver_name", "AriaCast Android") ?: "AriaCast Android"
+
+        server = AriaCastServer(applicationContext, ServerConfig(serverName = savedName))
         server.start()
 
-        val rootLayout = findViewById<ConstraintLayout>(R.id.root_layout)
+        rootLayout = findViewById(R.id.root_layout)
         val artwork = findViewById<ImageView>(R.id.artwork)
         title = findViewById(R.id.title)
         artist = findViewById(R.id.artist)
@@ -51,43 +62,106 @@ class MainActivity : AppCompatActivity() {
         currentTime = findViewById(R.id.current_time)
         totalTime = findViewById(R.id.total_time)
 
-        // Set initial icon
         artwork.setImageResource(R.drawable.ic_ariacast)
 
+        setupGestures()
+
+        // 1. Track Info (Title, Artist, Duration)
         lifecycleScope.launch {
-            server.metadata.collectLatest { meta ->
-                if (meta.artworkUrl != currentArtUrl) {
-                    currentArtUrl = meta.artworkUrl
-                    if (meta.artworkUrl != null) {
-                        artwork.load(meta.artworkUrl) {
-                            crossfade(true)
-                            placeholder(R.drawable.ic_ariacast)
-                            error(R.drawable.ic_ariacast)
-                            allowHardware(false)
-                            listener(onSuccess = { _, result ->
-                                val bitmap = (result.drawable as? BitmapDrawable)?.bitmap
-                                if (bitmap != null) {
-                                    updateBackgroundFromArtwork(bitmap, rootLayout)
-                                }
-                            })
-                        }
-                    } else {
-                        artwork.setImageResource(R.drawable.ic_ariacast)
-                    }
+            server.metadata
+                .distinctUntilChanged { old, new ->
+                    old.title == new.title && old.artist == new.artist && old.durationMs == new.durationMs
                 }
+                .collect { meta ->
+                    title.text = meta.title ?: "AriaCast Receiver"
+                    artist.text = meta.artist ?: "Ready to cast"
+                    totalTime.text = formatTime(meta.durationMs)
+                    progressBar.max = (meta.durationMs / 1000).toInt().coerceAtLeast(1)
+                }
+        }
 
-                title.text = meta.title ?: "AriaCast Receiver"
-                artist.text = meta.artist ?: "Ready to cast"
-
-                val durationSeconds = (meta.durationMs / 1000).toInt()
-                progressBar.max = if (durationSeconds > 0) durationSeconds else 100
-                totalTime.text = formatTime(meta.durationMs)
-
-                val positionSeconds = (meta.positionMs / 1000).toInt()
-                progressBar.progress = positionSeconds
-                currentTime.text = formatTime(meta.positionMs)
+        // 2. Artwork Handling (Using Bytes for maximum compatibility)
+        lifecycleScope.launch {
+            server.artworkBytes.collect { bytes ->
+                if (bytes != null) {
+                    artwork.load(bytes) {
+                        crossfade(true)
+                        allowHardware(false)
+                        listener(onSuccess = { _, result ->
+                            val bitmap = (result.drawable as? BitmapDrawable)?.bitmap
+                            if (bitmap != null) {
+                                updateBackgroundFromArtwork(bitmap)
+                            }
+                        })
+                    }
+                } else {
+                    artwork.setImageResource(R.drawable.ic_ariacast)
+                }
             }
         }
+
+        // 3. Position Updates (Frequent but cheap)
+        lifecycleScope.launch {
+            server.metadata
+                .map { it.positionMs }
+                .distinctUntilChanged()
+                .collect { pos ->
+                    progressBar.progress = (pos / 1000).toInt()
+                    currentTime.text = formatTime(pos)
+                }
+        }
+    }
+
+    private fun setupGestures() {
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            
+            private var lastTapTime = 0L
+            private var tapCount = 0
+
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                val now = System.currentTimeMillis()
+                if (now - lastTapTime < 350) {
+                    tapCount++
+                } else {
+                    tapCount = 1
+                }
+                lastTapTime = now
+
+                if (tapCount == 3) {
+                    showSettingsDialog()
+                    tapCount = 0
+                }
+                return true
+            }
+        })
+
+        rootLayout.setOnTouchListener { _, event ->
+            gestureDetector.onTouchEvent(event)
+        }
+    }
+
+    private fun showSettingsDialog() {
+        val prefs = getSharedPreferences("AriaCastPrefs", Context.MODE_PRIVATE)
+        val currentName = prefs.getString("receiver_name", "AriaCast Android") ?: "AriaCast Android"
+
+        val input = EditText(this)
+        input.setText(currentName)
+        input.setPadding(64, 32, 64, 32)
+
+        AlertDialog.Builder(this)
+            .setTitle("Receiver Settings")
+            .setMessage("Choose a name for this receiver:")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val newName = input.text.toString()
+                if (newName.isNotBlank()) {
+                    prefs.edit().putString("receiver_name", newName).apply()
+                    server.updateName(newName)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun hideSystemUI() {
@@ -98,7 +172,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateBackgroundFromArtwork(bitmap: Bitmap, rootLayout: ConstraintLayout) {
+    private fun updateBackgroundFromArtwork(bitmap: Bitmap) {
         Palette.from(bitmap).generate { palette ->
             val defaultStartColor = ContextCompat.getColor(this, R.color.default_gradient_start)
             val defaultEndColor = ContextCompat.getColor(this, R.color.default_gradient_end)
@@ -115,15 +189,14 @@ class MainActivity : AppCompatActivity() {
             val oldDrawable = rootLayout.background
             val transition = TransitionDrawable(arrayOf(oldDrawable, newGradient))
             rootLayout.background = transition
-            transition.startTransition(500)
+            transition.isCrossFadeEnabled = true
+            transition.startTransition(800)
 
-            // Adjust text and UI colors based on background luminance
             updateUIColors(startColor)
         }
     }
 
     private fun updateUIColors(backgroundColor: Int) {
-        // Calculate luminance: 0 is black, 1 is white
         val luminance = 0.2126 * Color.red(backgroundColor) / 255 +
                         0.7152 * Color.green(backgroundColor) / 255 +
                         0.0722 * Color.blue(backgroundColor) / 255
@@ -136,7 +209,6 @@ class MainActivity : AppCompatActivity() {
         currentTime.setTextColor(secondaryColor)
         totalTime.setTextColor(secondaryColor)
         
-        // Update progress bar color
         progressBar.progressTintList = ColorStateList.valueOf(primaryColor)
         progressBar.progressBackgroundTintList = ColorStateList.valueOf(secondaryColor)
     }

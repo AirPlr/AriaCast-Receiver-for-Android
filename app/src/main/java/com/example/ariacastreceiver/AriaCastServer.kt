@@ -24,6 +24,7 @@ import javax.jmdns.JmDNS
 import javax.jmdns.ServiceInfo
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.*
@@ -31,7 +32,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 class AriaCastServer(
     private val context: Context,
-    private val config: ServerConfig = ServerConfig()
+    private var config: ServerConfig = ServerConfig()
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var server: EmbeddedServer<*, *>? = null
@@ -43,8 +44,10 @@ class AriaCastServer(
     
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying = _isPlaying.asStateFlow()
+
+    private val _artworkBytes = MutableStateFlow<ByteArray?>(null)
+    val artworkBytes = _artworkBytes.asStateFlow()
     
-    private var artworkBytes: ByteArray? = null
     private var lastRemoteArtworkUrl: String? = null
     
     private val metadataClients = ConcurrentHashMap.newKeySet<DefaultWebSocketServerSession>()
@@ -59,6 +62,18 @@ class AriaCastServer(
     private val json = Json {
         ignoreUnknownKeys = true
         coerceInputValues = true
+    }
+
+    fun updateName(newName: String) {
+        config = config.copy(serverName = newName)
+        restartDiscovery()
+    }
+
+    private fun restartDiscovery() {
+        scope.launch(Dispatchers.IO) {
+            jmdns?.unregisterAllServices()
+            startDiscovery()
+        }
     }
 
     fun start() {
@@ -80,9 +95,7 @@ class AriaCastServer(
             }
             
             routing {
-                // Audio Input
                 webSocket("/audio") {
-                    Log.i("AriaCastServer", "Audio source connected")
                     try {
                         sendSerialized(HandshakeResponse(
                             status = "READY",
@@ -99,10 +112,12 @@ class AriaCastServer(
                             if (frame is Frame.Binary) {
                                 val data = frame.data
                                 audioPlayer.enqueueFrame(data)
-                                // Broadcast to web listeners
-                                listeningClients.forEach { client ->
-                                    scope.launch {
-                                        try { client.send(Frame.Binary(true, data)) } catch (e: Exception) {}
+                                if (listeningClients.isNotEmpty()) {
+                                    val binaryFrame = Frame.Binary(true, data)
+                                    listeningClients.forEach { client ->
+                                        scope.launch {
+                                            try { client.send(binaryFrame) } catch (e: Exception) {}
+                                        }
                                     }
                                 }
                             }
@@ -111,14 +126,11 @@ class AriaCastServer(
                         Log.e("AriaCastServer", "Audio socket error: ${e.message}")
                     } finally {
                         audioPlayer.stop()
-                        Log.i("AriaCastServer", "Audio source disconnected")
                     }
                 }
                 
-                // Control WebSocket
                 webSocket("/control") {
                     controlClients.add(this)
-                    Log.i("AriaCastServer", "Control client connected")
                     try {
                         for (frame in incoming) {
                             if (frame is Frame.Text) {
@@ -126,18 +138,14 @@ class AriaCastServer(
                                 try {
                                     val command = json.decodeFromString<ControlMessage>(text)
                                     handleCommand(command)
-                                } catch (e: Exception) {
-                                    Log.e("AriaCastServer", "Error decoding command: ${e.message}")
-                                }
+                                } catch (e: Exception) {}
                             }
                         }
                     } finally {
                         controlClients.remove(this)
-                        Log.i("AriaCastServer", "Control client disconnected")
                     }
                 }
 
-                // Metadata WebSocket
                 webSocket("/metadata") {
                     metadataClients.add(this)
                     try {
@@ -153,9 +161,7 @@ class AriaCastServer(
                                     if (root["type"]?.jsonPrimitive?.content == "update") {
                                         root["data"]?.jsonObject?.let { updateMetadataFromJson(it) }
                                     }
-                                } catch (e: Exception) {
-                                    Log.e("AriaCastServer", "Error handling metadata ws update: ${e.message}")
-                                }
+                                } catch (e: Exception) {}
                             }
                         }
                     } finally {
@@ -163,7 +169,6 @@ class AriaCastServer(
                     }
                 }
 
-                // Web Listen WebSocket
                 webSocket("/listen") {
                     listeningClients.add(this)
                     try {
@@ -171,18 +176,20 @@ class AriaCastServer(
                             "sample_rate" to config.audio.sampleRate,
                             "channels" to config.audio.channels
                         ))
-                    } catch (e: Exception) {}
-                    
-                    try {
-                        for (frame in incoming) { /* Keep alive */ }
+                        for (frame in incoming) { }
                     } finally {
                         listeningClients.remove(this)
                     }
                 }
 
-                // HTTP Endpoints
                 get("/artwork") {
-                    artworkBytes?.let {
+                    _artworkBytes.value?.let {
+                        call.respondBytes(it, ContentType.Image.JPEG)
+                    } ?: call.respond(HttpStatusCode.NotFound)
+                }
+
+                get("/image/artwork") {
+                    _artworkBytes.value?.let {
                         call.respondBytes(it, ContentType.Image.JPEG)
                     } ?: call.respond(HttpStatusCode.NotFound)
                 }
@@ -194,7 +201,6 @@ class AriaCastServer(
                         data?.let { updateMetadataFromJson(it) }
                         call.respond(mapOf("success" to true))
                     } catch (e: Exception) {
-                        Log.e("AriaCastServer", "POST /metadata error: ${e.message}")
                         call.respond(HttpStatusCode.BadRequest, mapOf("error" to e.message))
                     }
                 }
@@ -217,34 +223,31 @@ class AriaCastServer(
         
         startDiscovery()
         startUdpDiscovery()
-        Log.i("AriaCastServer", "Server started on port ${config.streamingPort}")
     }
 
     fun handleCommand(cmd: ControlMessage) {
         val action = cmd.action ?: cmd.command
-        Log.i("AriaCastServer", "Handling command: $action")
         when (action) {
             "play" -> {
                 _isPlaying.value = true
-                updateMetadata(_metadata.value.copy(isPlaying = true))
+                updateMetadata(_metadata.value.copy(isPlaying = true), false)
             }
             "pause" -> {
                 _isPlaying.value = false
-                updateMetadata(_metadata.value.copy(isPlaying = false))
+                updateMetadata(_metadata.value.copy(isPlaying = false), false)
             }
             "play_pause" -> {
                 val newState = !_isPlaying.value
                 _isPlaying.value = newState
-                updateMetadata(_metadata.value.copy(isPlaying = newState))
+                updateMetadata(_metadata.value.copy(isPlaying = newState), false)
             }
             "stop" -> {
                 _isPlaying.value = false
                 audioPlayer.stop()
-                updateMetadata(_metadata.value.copy(isPlaying = false))
+                updateMetadata(_metadata.value.copy(isPlaying = false), false)
             }
         }
         
-        // Broadcast to all control clients
         scope.launch {
             controlClients.forEach { client ->
                 try { client.sendSerialized(cmd) } catch (e: Exception) {}
@@ -254,49 +257,44 @@ class AriaCastServer(
 
     private fun updateMetadataFromJson(data: JsonObject) {
         val current = _metadata.value
+        var songChanged = false
         
-        val newTitle = data["title"]?.jsonPrimitive?.contentOrNull ?: current.title
-        val newArtist = data["artist"]?.jsonPrimitive?.contentOrNull ?: current.artist
-        val newAlbum = data["album"]?.jsonPrimitive?.contentOrNull ?: current.album
-        val newArtworkUrl = data["artwork_url"]?.jsonPrimitive?.contentOrNull 
-            ?: data["artworkUrl"]?.jsonPrimitive?.contentOrNull 
-            ?: current.artworkUrl
+        val newTitle = data["title"]?.jsonPrimitive?.contentOrNull
+        if (newTitle != null && newTitle != current.title) {
+            songChanged = true
+        }
         
-        val newDuration = data["duration_ms"]?.jsonPrimitive?.longOrNull 
-            ?: data["durationMs"]?.jsonPrimitive?.longOrNull 
-            ?: current.durationMs
-            
-        val newPosition = data["position_ms"]?.jsonPrimitive?.longOrNull 
-            ?: data["positionMs"]?.jsonPrimitive?.longOrNull 
-            ?: current.positionMs
-            
-        val newIsPlaying = data["is_playing"]?.jsonPrimitive?.booleanOrNull 
-            ?: data["isPlaying"]?.jsonPrimitive?.booleanOrNull 
-            ?: current.isPlaying
-
         val updated = current.copy(
-            title = newTitle,
-            artist = newArtist,
-            album = newAlbum,
-            artworkUrl = newArtworkUrl,
-            durationMs = newDuration,
-            positionMs = newPosition,
-            isPlaying = newIsPlaying
+            title = newTitle ?: current.title,
+            artist = data["artist"]?.jsonPrimitive?.contentOrNull ?: current.artist,
+            album = data["album"]?.jsonPrimitive?.contentOrNull ?: current.album,
+            artworkUrl = data["artwork_url"]?.jsonPrimitive?.contentOrNull 
+                ?: data["artworkUrl"]?.jsonPrimitive?.contentOrNull 
+                ?: current.artworkUrl,
+            durationMs = data["duration_ms"]?.jsonPrimitive?.longOrNull 
+                ?: data["durationMs"]?.jsonPrimitive?.longOrNull 
+                ?: current.durationMs,
+            positionMs = data["position_ms"]?.jsonPrimitive?.longOrNull 
+                ?: data["positionMs"]?.jsonPrimitive?.longOrNull 
+                ?: current.positionMs,
+            isPlaying = data["is_playing"]?.jsonPrimitive?.booleanOrNull 
+                ?: data["isPlaying"]?.jsonPrimitive?.booleanOrNull 
+                ?: current.isPlaying
         )
         
-        updateMetadata(updated)
+        updateMetadata(updated, songChanged)
     }
 
-    private fun updateMetadata(meta: Metadata) {
+    private fun updateMetadata(meta: Metadata, songChanged: Boolean) {
         _metadata.value = meta
         _isPlaying.value = meta.isPlaying
         
-        if (meta.artworkUrl != null && meta.artworkUrl != lastRemoteArtworkUrl && meta.artworkUrl.startsWith("http")) {
-            lastRemoteArtworkUrl = meta.artworkUrl
-            downloadArtwork(meta.artworkUrl)
+        val newUrl = meta.artworkUrl
+        if (newUrl != null && (newUrl != lastRemoteArtworkUrl || songChanged) && newUrl.startsWith("http")) {
+            lastRemoteArtworkUrl = newUrl
+            downloadArtwork(newUrl)
         }
         
-        // Broadcast
         scope.launch {
             val msg = MetadataMessage("metadata", meta)
             metadataClients.forEach { client ->
@@ -308,8 +306,16 @@ class AriaCastServer(
     private fun downloadArtwork(url: String) {
         scope.launch {
             try {
-                val bytes = java.net.URL(url).readBytes()
-                artworkBytes = bytes
+                val connection = java.net.URL(url).openConnection() as HttpURLConnection
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+                connection.connectTimeout = 5000
+                connection.readTimeout = 5000
+                
+                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                    val bytes = connection.inputStream.readBytes()
+                    _artworkBytes.value = bytes
+                }
+                connection.disconnect()
             } catch (e: Exception) {
                 Log.e("AriaCastServer", "Failed to download artwork: ${e.message}")
             }
@@ -320,7 +326,6 @@ class AriaCastServer(
         scope.launch(Dispatchers.IO) {
             try {
                 val ip = getLocalIpAddress()
-                Log.i("AriaCastServer", "Binding JmDNS to IP: $ip")
                 jmdns = JmDNS.create(InetAddress.getByName(ip))
                 val serviceInfo = ServiceInfo.create(
                     "_audiocast._tcp.local.",
@@ -334,7 +339,6 @@ class AriaCastServer(
                     )
                 )
                 jmdns?.registerService(serviceInfo)
-                Log.i("AriaCastServer", "mDNS service registered: ${config.serverName}")
             } catch (e: Exception) {
                 Log.e("AriaCastServer", "mDNS error: ${e.message}")
             }
@@ -347,14 +351,12 @@ class AriaCastServer(
                 val socket = DatagramSocket(config.discoveryPort)
                 socket.broadcast = true
                 val buffer = ByteArray(1024)
-                Log.i("AriaCastServer", "UDP Discovery listening on port ${config.discoveryPort}")
                 while (isActive) {
                     val packet = DatagramPacket(buffer, buffer.size)
                     try {
                         socket.receive(packet)
                         val data = String(packet.data, 0, packet.length).trim()
                         if (data == "DISCOVER_AUDIOCAST") {
-                            Log.i("AriaCastServer", "Discovery request from ${packet.address}")
                             val response = """
                                 {
                                     "server_name": "${config.serverName}",
@@ -393,9 +395,7 @@ class AriaCastServer(
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.e("AriaCastServer", "Error getting IP: ${e.message}")
-        }
+        } catch (e: Exception) {}
         return "127.0.0.1"
     }
 
