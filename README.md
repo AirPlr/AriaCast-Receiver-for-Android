@@ -1,4 +1,5 @@
 # AriaCast Receiver for Android
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/AriaCast/AriaCast-Receiver-for-Android/total?style=for-the-badge)
 
 A high-performance Android port of AriaCast Server. This application transforms your Android device (tablet or phone) into a powerful audio streaming receiver, fully compatible with AriaCast-enabled clients.
 
